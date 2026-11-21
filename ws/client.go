@@ -224,7 +224,6 @@ func NewClient(appId, appSecret string, opts ...ClientOption) *Client {
 		writeTimeout:      10 * time.Second,
 		httpClient:        &http.Client{Timeout: 10 * time.Second},
 		websocketDialer:   &dialer,
-		cache:             larkcache.New(30 * time.Second),
 		domain:            lark.FeishuBaseUrl,
 	}
 

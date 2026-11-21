@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +20,104 @@ import (
 
 	websocket "github.com/gorilla/websocket"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
+	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 )
+
+func cacheJanitors(t *testing.T) int {
+	t.Helper()
+	var stacks bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&stacks, 2); err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(stacks.String(), "github.com/larksuite/oapi-sdk-go/v3/cache.(*cron).start(")
+}
+
+func TestClientCacheJanitorsFollowRunLifetime(t *testing.T) {
+	baseline := cacheJanitors(t)
+	for i := 0; i < 8; i++ {
+		if client := NewClient("app-id", "app-secret"); client.cache != nil {
+			t.Fatal("constructor started a cache")
+		}
+	}
+	if got := cacheJanitors(t); got != baseline {
+		t.Fatalf("constructors retained janitors: %d -> %d", baseline, got)
+	}
+	domain, cleanup := installLifecycleBootstrapHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "local bootstrap failure", http.StatusServiceUnavailable)
+	}))
+	defer cleanup()
+	client := NewClient("app-id", "app-secret", WithDomain(domain), WithAutoReconnect(false))
+	for i := 0; i < 8; i++ {
+		if err := client.Start(context.Background()); err == nil {
+			t.Fatal("expected bootstrap failure")
+		}
+		if client.cache != nil {
+			t.Fatal("bootstrap failure retained cache")
+		}
+	}
+	runtime.GC()
+	if got := cacheJanitors(t); got != baseline {
+		t.Fatalf("after teardown and GC: %d -> %d", baseline, got)
+	}
+	t.Logf("SDK cache janitors: baseline=%d after_8_constructors_and_8_restarts=%d", baseline, cacheJanitors(t))
+}
+
+func TestClientCacheWaitsForMessageWorkersBeforeTeardown(t *testing.T) {
+	baseline := cacheJanitors(t)
+	gateway, cleanupGateway := newLifecycleGateway(t)
+	defer cleanupGateway()
+	var requests int32
+	domain, cleanupBootstrap := installLifecycleBootstrap(t, gateway.endpoint(), &requests)
+	defer cleanupBootstrap()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready, workerStarted := make(chan struct{}, 1), make(chan struct{})
+	cacheAssertionsDone := make(chan struct{})
+	var client *Client
+	handler := dispatcher.NewEventDispatcher("", "").OnCustomizedEvent("test.cache", func(ctx context.Context, _ *larkevent.EventReq) error {
+		close(workerStarted)
+		<-ctx.Done()
+		client.cache.Set("worker", "still-owned", time.Minute)
+		if client.cache.Get("worker") != "still-owned" {
+			t.Error("cache was torn down before its message worker")
+			return nil
+		}
+		close(cacheAssertionsDone)
+		return nil
+	})
+	client = NewClient("app-id", "app-secret", WithDomain(domain), WithAutoReconnect(false), WithEventHandler(handler), WithOnReady(func() { ready <- struct{}{} }))
+	result := startLifecycleClient(client, ctx)
+	waitLifecycleSignal(t, ready, "ready")
+	serverConn := waitAcceptedGatewayConnection(t, gateway)
+	headers := Headers{}
+	headers.Add(HeaderType, string(MessageTypeEvent))
+	frame, err := (&Frame{Method: int32(FrameTypeData), Headers: headers, Payload: []byte(`{"header":{"event_type":"test.cache"}}`)}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := serverConn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+		t.Fatal(err)
+	}
+	waitLifecycleSignal(t, workerStarted, "message worker admission")
+	cancel()
+	if err, ok := waitLifecycleResult(result); !ok || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled Start did not join its workers: %v, completed=%v", err, ok)
+	}
+	select {
+	case <-cacheAssertionsDone:
+	default:
+		t.Fatal("message worker cache assertions did not complete")
+	}
+	if err := client.CloseAndWait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	if client.cache != nil || cacheJanitors(t) != baseline {
+		t.Fatal("connected cancellation retained cache or janitor")
+	}
+	t.Logf("SDK cache janitors: baseline=%d after_connected_cancel_and_GC=%d", baseline, cacheJanitors(t))
+}
 
 const lifecycleTestTimeout = 2 * time.Second
 const lifecycleNoProgressTimeout = 100 * time.Millisecond

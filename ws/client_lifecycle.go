@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	larkcache "github.com/larksuite/oapi-sdk-go/v3/cache"
 )
 
 type runStopReason uint8
@@ -104,6 +106,7 @@ func (c *Client) beginRun(callerCtx context.Context) (*clientRun, error) {
 
 	runCtx, cancel := context.WithCancel(callerCtx)
 	run := &clientRun{ctx: runCtx, cancel: cancel, done: make(chan struct{})}
+	c.cache = larkcache.New(30 * time.Second)
 	c.run = run
 	c.stateMu.Unlock()
 	return run, nil
@@ -139,8 +142,15 @@ func (c *Client) finishRun(run *clientRun) error {
 	run.cancel()
 	run.wg.Wait()
 
+	// All cache users have exited; join its janitor without holding stateMu.
+	c.stateMu.Lock()
+	cache := c.cache
+	c.stateMu.Unlock()
+	cache.Close()
+
 	c.stateMu.Lock()
 	err := run.stopErr
+	c.cache = nil
 	c.run = nil
 	c.stateMu.Unlock()
 	close(run.done)
